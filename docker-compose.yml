@@ -1,0 +1,14 @@
+services:
+  ai-memory:
+    image: akitaonrails/ai-memory:${VERSION:-2.1.0}
+    container_name: ai-memory
+    ports:
+      - 127.0.0.1:${PORT:-49374}:49374
+    volumes:
+      - ~/.local/share/ai-memory:/data
+      - ~/.config/ai-memory/config.toml:/app/config.toml:ro
+    environment:
+      - RUST_LOG=info
+      - AI_MEMORY_DATA_DIR=/data
+      - AI_MEMORY_BIND=0.0.0.0:49374
+    restart: unless-stopped
