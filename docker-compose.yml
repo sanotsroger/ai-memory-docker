@@ -7,8 +7,13 @@ services:
     volumes:
       - ~/.local/share/ai-memory:/data
       - ~/.config/ai-memory/config.toml:/app/config.toml:ro
+      # Os hooks rodam DENTRO do container: sem enxergar os repositórios no mesmo
+      # caminho absoluto do host, o roteador não acha o .git nem o .ai-memory.toml
+      # e cai em basename(cwd) — o que cria um projeto separado por subpasta.
+      # Montagem read-only: o ai-memory só precisa ler a árvore para resolver o escopo.
+      - ${PROJECTS_DIR:?defina PROJECTS_DIR no .env (make init preenche automaticamente)}:${PROJECTS_DIR}:ro
     environment:
       - RUST_LOG=info
       - AI_MEMORY_DATA_DIR=/data
       - AI_MEMORY_BIND=0.0.0.0:49374
-    restart: unless-stopped
+    restart: always
