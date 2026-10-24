@@ -131,7 +131,7 @@ Depois sobe o [`server/docker-compose.yml`](server/docker-compose.yml) em `0.0.0
 - `AI_MEMORY_ALLOWED_HOSTS`: todo nome ou IP pelo qual os clientes chegam ao servidor (o domínio público basta quando o proxy repassa o `Host`);
 - `AI_MEMORY_AUTH__SECURE_COOKIE=true`: vale para quando o `/web` é servido em HTTPS pelo proxy. Tire se for acessar direto por HTTP.
 
-**Proxy TLS.** O token viaja no header `Authorization`, então exponha o servidor só atrás de HTTPS. Com o Traefik (file provider):
+**Proxy TLS.** O token viaja no header `Authorization`, então exponha o servidor só atrás de HTTPS. O ai-memory não serve nada em `/` (responde 404), porque a interface fica em `/web/`. Por isso o exemplo redireciona a raiz. Com o Traefik (file provider):
 
 ```yaml
 http:
@@ -140,7 +140,13 @@ http:
       entryPoints: ["https"]
       rule: "Host(`memo.sanotsroger.com.br`)"
       tls: {}
+      middlewares: [memo-root-to-web]
       service: memo
+  middlewares:
+    memo-root-to-web:
+      redirectRegex:
+        regex: "^https://memo\\.sanotsroger\\.com\\.br/$"
+        replacement: "https://memo.sanotsroger.com.br/web/"
   services:
     memo:
       loadBalancer:
@@ -148,6 +154,14 @@ http:
           - url: "http://<ip-do-servidor>:49374"
         passHostHeader: true
 ```
+
+**Interface web.** O login em `/web/` é com usuário e senha. O token bearer vale só para MCP, hooks e CLI. Para criar o usuário `root`:
+
+1. Ponha `AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD=<12+ caracteres>` no `.env.production` e rode `make server-start`.
+2. Apague a linha e rode `make server-start` de novo, para a senha não ficar no ambiente do processo.
+3. No primeiro login, a web obriga a trocar a senha.
+
+Se perder a senha, siga o fluxo de recuperação (`AI_MEMORY_AUTH__RECOVERY_TOKEN`) do [guia do upstream](https://github.com/akitaonrails/ai-memory/blob/main/docs/install.md#human-password-bootstrap-and-recovery).
 
 **LLM.** Sem provedor configurado, o servidor funciona com busca FTS5 e resumos por regras, sem custo. Para ligar a consolidação por LLM (handoffs e páginas da wiki melhores), descomente o bloco de LLM no `.env.production` e rode `make server-start` de novo. As opções e os custos estão na [documentação do upstream](https://github.com/akitaonrails/ai-memory/blob/main/docs/deploy.md#llm-provider-choices).
 
