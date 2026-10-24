@@ -57,17 +57,32 @@ CODEX_HOOK_EVENTS := $(filter-out SubagentStart:% SubagentStop:%,$(HOOK_EVENTS))
 # (exige PROJECTS_DIR montado no container). Um .ai-memory.toml no repo ainda vence.
 PROJECT_STRATEGY ?= repo-root
 
-# Workaround para o ai-memory 2.1.0: o drenador cria $(SPOOL_DIR)/.drain.lock e não o
+# Workaround nascido no ai-memory 2.1.0 (o changelog da 3.x não registra a correção,
+# então segue no modo local): o drenador cria $(SPOOL_DIR)/.drain.lock e não o
 # remove ao terminar. O lock órfão faz a drenagem seguinte desistir em silêncio
 # (`retries: 0`, `pending` só crescendo), e a fila fica parada até alguém apagá-lo à mão.
 # Por isso todo hook apaga antes um lock com mais de 1 minuto: uma drenagem real leva
 # menos de um segundo, e o servidor já protege reentrega com chave de idempotência.
 
+# --- Modo remoto ---------------------------------------------------------------
+# Servidor: roda no host que expõe o ai-memory na rede (LXC atrás do Traefik).
+SERVER_DIR := server
+SERVER_ENV := $(SERVER_DIR)/.env.production
+SERVER_COMPOSE := docker compose --project-directory $(SERVER_DIR) --env-file $(SERVER_ENV) -f $(SERVER_DIR)/docker-compose.yml
+
+# Cliente: hooks nativos (binário ai-memory no host) falando HTTP com o servidor.
+REMOTE_URL ?= https://memo.sanotsroger.com.br
+TOKEN ?=
+
 .PHONY: help init start stop restart logs status upgrade version doctor spool-unblock \
-	hooks hooks-claude-code hooks-codex hooks-grok require-jq
+	hooks hooks-claude-code hooks-codex hooks-grok require-jq \
+	server-init server-start server-stop server-logs server-upgrade server-backup \
+	remote-client remote-doctor require-ai-memory
 
 help:
-	@echo "Uso: make {init|start|stop|restart|logs|status|doctor|spool-unblock|hooks|upgrade|version}"
+	@echo "Uso (modo local):  make {init|start|stop|restart|logs|status|doctor|spool-unblock|hooks|upgrade|version}"
+	@echo "Uso (servidor):    make {server-init|server-start|server-stop|server-logs|server-upgrade|server-backup}"
+	@echo "Uso (cliente):     make {remote-client|remote-doctor}"
 	@echo ""
 	@echo "Exemplos:"
 	@echo "  make init                    # Criar .env, diretórios e config padrão"
@@ -81,6 +96,13 @@ help:
 	@echo "  make spool-unblock           # Destravar a fila de hooks parada por item inválido"
 	@echo "  make hooks                   # Reinstalar os hooks (Claude Code, Codex e Grok)"
 	@echo "  make hooks AGENTS=codex      # Reinstalar os hooks de um agente só"
+	@echo ""
+	@echo "  make server-init             # (servidor) .env.production com token novo + diretório de dados"
+	@echo "  make server-start            # (servidor) subir o ai-memory exposto na rede"
+	@echo "  make server-upgrade VERSION=3.2.2"
+	@echo "  make server-backup           # (servidor) snapshot consistente em \$$SERVER_DATA_DIR"
+	@echo "  make remote-client TOKEN=... # (cliente) hooks + MCP apontando para $(REMOTE_URL)"
+	@echo "  make remote-doctor           # (cliente) status do servidor e da fila local de hooks"
 
 init:
 	@if [ ! -f $(ENV_FILE) ]; then \
@@ -259,3 +281,91 @@ spool-unblock:
 	@rm -f $(SPOOL_DIR)/.drain.lock
 	@echo "✓ fila liberada — o próximo hook (próximo prompt em qualquer agente) drena o que ficou pendente"
 	@echo "  confira depois com: make doctor"
+
+# --- Modo remoto: servidor ------------------------------------------------------
+# Rodam no host do servidor (ex.: LXC 138 em /opt/ai-memory-docker).
+
+server-init:
+	@if [ ! -f $(SERVER_ENV) ]; then \
+		cp $(SERVER_ENV).example $(SERVER_ENV); chmod 600 $(SERVER_ENV); \
+		echo "✓ $(SERVER_ENV) criado a partir de $(SERVER_ENV).example"; \
+	fi
+	@if grep -q '^AI_MEMORY_AUTH_TOKEN=$$' $(SERVER_ENV); then \
+		ver=$$(sed -n 's/^VERSION=//p' $(SERVER_ENV)); \
+		tok=$$(docker run --rm -e RUST_LOG=error akitaonrails/ai-memory:$${ver:-latest} generate-auth-token) || exit 1; \
+		sed -i "s/^AI_MEMORY_AUTH_TOKEN=$$/AI_MEMORY_AUTH_TOKEN=$$tok/" $(SERVER_ENV); \
+		echo "✓ token bearer gerado em $(SERVER_ENV) — guarde-o: os clientes usam em 'make remote-client TOKEN=...'"; \
+	fi
+	@dir=$$(sed -n 's/^SERVER_DATA_DIR=//p' $(SERVER_ENV)); dir=$${dir:-/var/opt/ai-memory/data}; \
+		mkdir -p "$$dir" && chown 1000:1000 "$$dir" && echo "✓ dados em $$dir (dono 1000:1000)"
+
+server-start: server-init
+	$(SERVER_COMPOSE) up -d
+	@echo "✓ ai-memory (servidor) iniciado — confira com: docker inspect -f '{{.State.Health.Status}}' ai-memory"
+
+server-stop:
+	$(SERVER_COMPOSE) down
+
+server-logs:
+	$(SERVER_COMPOSE) logs -f --tail=50
+
+# Exige VERSION explícita: no servidor não há .env local, e o default do Makefile
+# (latest) trocaria de versão sem querer.
+server-upgrade:
+	@[ "$(origin VERSION)" = "command line" ] || { echo "✗ informe a versão: make server-upgrade VERSION=x.y.z"; exit 1; }
+	@cp $(SERVER_ENV) $(SERVER_ENV).backup
+	@sed -i 's/^VERSION=.*/VERSION=$(VERSION)/' $(SERVER_ENV)
+	@$(MAKE) --no-print-directory server-backup
+	$(SERVER_COMPOSE) pull
+	$(SERVER_COMPOSE) up -d
+	@echo "✓ servidor em $(VERSION) (env anterior em $(SERVER_ENV).backup)"
+
+# Snapshot pela API de backup online do SQLite: coerente mesmo com o servidor no ar.
+server-backup:
+	docker exec ai-memory ai-memory backup --to /data/snapshot-$$(date +%F-%H%M).tar.gz
+	@echo "✓ snapshot em \$$SERVER_DATA_DIR/snapshot-*.tar.gz"
+
+# --- Modo remoto: cliente -------------------------------------------------------
+# Usa o binário nativo (no Arch: paru -S ai-memory-bin). Os hooks rodam no host,
+# então enxergam o .git direto e dispensam o PROJECTS_DIR do modo local; a fila
+# (hook-spool) fica no data dir do cliente e drena quando o servidor responde.
+# O install-hooks guarda o token em <data_dir>/auth-token, que o bridge MCP do
+# Claude Code (--session-aware) também lê: nada de token no ~/.claude.json.
+# Cuidado: com AI_MEMORY_AUTH_TOKEN exportado no shell, o install-mcp trata o
+# token como explícito e o grava no ~/.claude.json, por isso o env -u.
+# O <data_dir>/config.toml aponta o CLI avulso (status, search...) para o mesmo
+# servidor e token; sem ele o CLI tenta 127.0.0.1.
+CLIENT_DATA_DIR := $(DATA_DIR)
+CLIENT_CONFIG := $(CLIENT_DATA_DIR)/config.toml
+
+require-ai-memory:
+	@command -v ai-memory >/dev/null 2>&1 || { echo "✗ ai-memory não encontrado — no Arch: paru -S ai-memory-bin"; exit 1; }
+
+remote-client: require-ai-memory
+	@for a in $(AGENTS); do \
+		case $$a in claude-code) d=$(CLAUDE_DIR);; codex) d=$(CODEX_DIR);; grok) d=$(GROK_DIR);; esac; \
+		if [ ! -d "$$d" ]; then echo "⚠ $$a não detectado ($$d ausente) — pulando"; continue; fi; \
+		env -u AI_MEMORY_AUTH_TOKEN ai-memory install-hooks --agent $$a --apply --server-url $(REMOTE_URL) \
+			$(if $(TOKEN),--auth-token $(TOKEN)) --project-strategy $(PROJECT_STRATEGY) || exit 1; \
+		if [ $$a = claude-code ]; then \
+			env -u AI_MEMORY_AUTH_TOKEN ai-memory install-mcp --client claude-code --session-aware --apply --server-url $(REMOTE_URL) || exit 1; \
+		else \
+			env -u AI_MEMORY_AUTH_TOKEN ai-memory install-mcp --client $$a --apply --server-url $(REMOTE_URL) || exit 1; \
+		fi; \
+		echo "✓ $$a → $(REMOTE_URL)"; \
+	done
+	@if [ -f $(CLIENT_CONFIG) ] && ! grep -q '^server_url = "$(REMOTE_URL)"' $(CLIENT_CONFIG); then \
+		echo "⚠ $(CLIENT_CONFIG) já existe e não aponta para $(REMOTE_URL) — ajuste server_url à mão"; \
+	elif [ ! -f $(CLIENT_CONFIG) ]; then \
+		printf 'server_url = "%s"\n\n[auth]\nbearer_token_file = "auth-token"\n' "$(REMOTE_URL)" > $(CLIENT_CONFIG); \
+		echo "✓ $(CLIENT_CONFIG): CLI avulso aponta para $(REMOTE_URL) com o token do auth-token"; \
+	fi
+
+remote-doctor: require-ai-memory
+	@echo "== servidor =="
+	@code=$$(curl -s -o /dev/null -w '%{http_code}' $(REMOTE_URL)/handoff); \
+		case $$code in 401) echo "  ✓ $(REMOTE_URL) responde e exige token";; \
+		200) echo "  ⚠ $(REMOTE_URL) responde SEM exigir token";; \
+		*) echo "  ✗ $(REMOTE_URL)/handoff → HTTP $$code";; esac
+	@echo "== status (servidor + fila local de hooks) =="
+	@RUST_LOG=warn ai-memory status

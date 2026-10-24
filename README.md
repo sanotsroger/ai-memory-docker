@@ -2,6 +2,18 @@
 
 Setup do [ai-memory](https://github.com/akitaonrails/ai-memory) rodando em container, com Makefile para gerenciar o ciclo de vida e integração com o Claude Code, o Codex CLI e o Grok CLI.
 
+Dois modos de uso:
+
+| | Modo local | Modo remoto (homelab) |
+|---|---|---|
+| Servidor | container nesta máquina, em `127.0.0.1` | container num host da rede ([`server/`](server/)), atrás de um proxy TLS |
+| Hooks | `docker exec ai-memory ai-memory hook ...` | binário nativo `ai-memory hook ...` no host |
+| Escopo do projeto | precisa do `PROJECTS_DIR` montado no container | o hook já enxerga o `.git`, então não precisa de nada |
+| Autenticação | nenhuma (loopback) | token bearer |
+| Comandos | `make start`, `make hooks`, `make doctor` | `make server-*` no servidor, `make remote-client` / `make remote-doctor` no cliente |
+
+O modo local é descrito logo abaixo. O remoto está em [Modo remoto (homelab)](#modo-remoto-homelab).
+
 ## Pré-requisitos
 
 - Docker + Docker Compose
@@ -94,6 +106,87 @@ Sem isso, o roteador não acha o `.git` nem o `.ai-memory.toml` e cai em `basena
 
 `make init` grava `PROJECTS_DIR=$HOME/Projects` no `.env` se ainda não existir — ajuste se seus repositórios ficam em outro lugar (precisa ser caminho absoluto; `~` não é expandido).
 
+## Modo remoto (homelab)
+
+Um único servidor na rede atende todas as máquinas. Cada cliente roda o binário nativo do ai-memory só como cliente HTTP: os hooks enfileiram os eventos no `hook-spool` local e drenam para o servidor (se ele estiver fora do ar, nada se perde e a fila drena quando ele voltar). O MCP do Claude Code usa o bridge `--session-aware`, que lê o token do data dir do cliente em vez de deixá-lo no `~/.claude.json`.
+
+### Servidor
+
+Num host com Docker (aqui, um LXC Alpine no Proxmox):
+
+```bash
+git clone https://github.com/sanotsroger/ai-memory-docker.git /opt/ai-memory-docker
+cd /opt/ai-memory-docker
+make server-start
+```
+
+O `make server-start` chama o `server-init`, que:
+
+- cria `server/.env.production` (gitignored, chmod 600) a partir de [`server/.env.production.example`](server/.env.production.example);
+- gera o `AI_MEMORY_AUTH_TOKEN` com `ai-memory generate-auth-token` se ele estiver vazio. **Guarde o token**, porque os clientes vão precisar dele;
+- cria o diretório de dados (`SERVER_DATA_DIR`, por padrão `/var/opt/ai-memory/data`) com dono `1000:1000`, o usuário da imagem.
+
+Depois sobe o [`server/docker-compose.yml`](server/docker-compose.yml) em `0.0.0.0:49374`, com healthcheck. Antes do primeiro start, revise no `.env.production`:
+
+- `AI_MEMORY_ALLOWED_HOSTS`: todo nome ou IP pelo qual os clientes chegam ao servidor (o domínio público basta quando o proxy repassa o `Host`);
+- `AI_MEMORY_AUTH__SECURE_COOKIE=true`: vale para quando o `/web` é servido em HTTPS pelo proxy. Tire se for acessar direto por HTTP.
+
+**Proxy TLS.** O token viaja no header `Authorization`, então exponha o servidor só atrás de HTTPS. Com o Traefik (file provider):
+
+```yaml
+http:
+  routers:
+    memo:
+      entryPoints: ["https"]
+      rule: "Host(`memo.sanotsroger.com.br`)"
+      tls: {}
+      service: memo
+  services:
+    memo:
+      loadBalancer:
+        servers:
+          - url: "http://<ip-do-servidor>:49374"
+        passHostHeader: true
+```
+
+**LLM.** Sem provedor configurado, o servidor funciona com busca FTS5 e resumos por regras, sem custo. Para ligar a consolidação por LLM (handoffs e páginas da wiki melhores), descomente o bloco de LLM no `.env.production` e rode `make server-start` de novo. As opções e os custos estão na [documentação do upstream](https://github.com/akitaonrails/ai-memory/blob/main/docs/deploy.md#llm-provider-choices).
+
+Comandos do servidor:
+
+```bash
+make server-start                  # sobe (idempotente)
+make server-stop                   # derruba
+make server-logs                   # logs em tempo real
+make server-backup                 # snapshot online (SQLite + wiki) em $SERVER_DATA_DIR/snapshot-*.tar.gz
+make server-upgrade VERSION=3.2.3  # backup, troca VERSION no .env.production, pull e recria
+```
+
+O `server-upgrade` exige `VERSION` explícita para não cair em `latest` sem querer.
+
+### Cliente
+
+1. Instale o binário nativo. No Arch: `paru -S ai-memory-bin`. Outras plataformas estão no [guia de instalação do upstream](https://github.com/akitaonrails/ai-memory/blob/main/docs/install.md).
+2. Configure hooks e MCP de cada agente instalado:
+
+   ```bash
+   make remote-client TOKEN=<token-do-servidor>
+   # outro servidor: make remote-client REMOTE_URL=https://outro.host TOKEN=...
+   ```
+
+   Para cada agente em `AGENTS` (Claude Code, Codex e Grok; os ausentes são pulados), o alvo roda:
+   - `ai-memory install-hooks --apply --server-url $REMOTE_URL --auth-token $TOKEN --project-strategy repo-root`;
+   - `ai-memory install-mcp --apply`, que no Claude Code é o bridge `--session-aware`.
+
+   O token fica em `~/.local/share/ai-memory/auth-token`. Uma reinstalação posterior sem `TOKEN=` reaproveita esse token. O alvo também cria `~/.local/share/ai-memory/config.toml` com `server_url` e `[auth] bearer_token_file = "auth-token"`, para que o CLI avulso (`ai-memory status`, `search`...) fale com o mesmo servidor. Sem isso, ele tenta `127.0.0.1`.
+
+   > Passe o token só por `TOKEN=`. Com `AI_MEMORY_AUTH_TOKEN` exportado no shell, o `install-mcp` trata o token como explícito e o grava em texto puro no `~/.claude.json` (e no backup `.claude.json.bak-*` ao lado). O `make remote-client` roda os instaladores com `env -u AI_MEMORY_AUTH_TOKEN` para evitar isso.
+3. Abra uma sessão nova do agente e confira:
+
+   ```bash
+   make remote-doctor   # 401 sem token no /handoff + `ai-memory status` (servidor e fila local)
+   claude mcp list      # ai-memory: ✔ Connected
+   ```
+
 ## Comandos
 
 ```bash
@@ -107,9 +200,11 @@ make spool-unblock           # destrava a fila parada por item inválido
 make hooks                   # reinstala os hooks em todos os agentes instalados
 make hooks AGENTS=codex      # reinstala os hooks de um agente só
 make version                 # versão rodando
-make upgrade VERSION=2.2.0   # atualizar para uma versão específica
+make upgrade VERSION=3.2.2   # atualizar para uma versão específica
 make upgrade                 # atualizar para latest
 ```
+
+(Os comandos do modo remoto estão na [seção própria](#modo-remoto-homelab).)
 
 `upgrade` atualiza `VERSION` em `.env` (com backup em `.env.backup`), puxa a imagem nova e reinicia. Alternativa manual: editar `VERSION` em `.env` e rodar `docker compose pull && docker compose up -d`.
 
@@ -169,11 +264,11 @@ make start
 
 ## Segurança
 
-A porta é publicada só em `127.0.0.1` (ver `docker-compose.yml`), então não é acessível pela rede local por padrão. Para expor na LAN, mude o bind para `0.0.0.0:${PORT:-49374}:49374` — só faça isso se confiar na rede, e considere configurar `AI_MEMORY_AUTH_TOKEN` (`ai-memory generate-auth-token`), já que por padrão o servidor não exige autenticação.
+No modo local, a porta é publicada só em `127.0.0.1` (ver `docker-compose.yml`), então o servidor não é acessível pela rede. Para expor na LAN, não mexa no bind do modo local: use o [modo remoto](#modo-remoto-homelab), que já sobe com token bearer e `AI_MEMORY_ALLOWED_HOSTS` e foi pensado para ficar atrás de um proxy TLS.
 
 ## Versões
 
-Tags disponíveis em <https://hub.docker.com/r/akitaonrails/ai-memory/tags>. `2.1.0` é a versão default do `.env.example`.
+Tags disponíveis em <https://hub.docker.com/r/akitaonrails/ai-memory/tags>. `3.2.2` é a versão default do `.env.example` e do `server/.env.production.example`. Ao subir de 2.x para 3.x com dados existentes, leia antes o [guia de upgrade do upstream](https://github.com/akitaonrails/ai-memory/blob/main/docs/upgrading-to-3.0.md).
 
 ## Créditos
 

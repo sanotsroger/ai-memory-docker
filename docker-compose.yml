@@ -1,6 +1,6 @@
 services:
   ai-memory:
-    image: akitaonrails/ai-memory:${VERSION:-2.1.0}
+    image: akitaonrails/ai-memory:${VERSION:-3.2.2}
     container_name: ai-memory
     ports:
       - 127.0.0.1:${PORT:-49374}:49374
